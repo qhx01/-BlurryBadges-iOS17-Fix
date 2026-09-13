@@ -1,0 +1,108 @@
+name: Build BlurryBadges iOS17 RootHide Fix
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup RootHide Theos
+        uses: waruhachi/theos-action@v2.4.6
+        with:
+          theos-src: roothide/theos
+          theos-branch: master
+          sdks-src: theos/sdks
+          sdks-branch: master
+          libgcuniversal: 'false'
+          altlist: 'false'
+
+      - name: Fetch upstream BlurryBadges
+        run: git clone --depth 1 https://github.com/PoomSmart/BlurryBadges.git source
+
+      - name: Apply iOS 17 crash fix
+        working-directory: source
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path("Tweak.xm")
+          s = p.read_text()
+
+          old = """static UIImage *roundedRectMask(CGSize size) {
+              CGFloat realCornerRadius = size.height / 2;"""
+          new = """static UIImage *roundedRectMask(CGSize size) {
+              // iOS 17: never pass a zero/negative badge size to UIGraphics.
+              if (size.width <= 0.0 || size.height <= 0.0)
+                  return nil;
+              CGFloat realCornerRadius = size.height / 2;"""
+          if old not in s:
+              raise SystemExit("roundedRectMask patch point not found")
+          s = s.replace(old, new, 1)
+
+          old = """    CGContextRef context = UIGraphicsGetCurrentContext();
+              CGContextSetFillColorWithColor(context, [UIColor blackColor].CGColor);"""
+          new = """    CGContextRef context = UIGraphicsGetCurrentContext();
+              if (context == NULL) {
+                  UIGraphicsEndImageContext();
+                  return nil;
+              }
+              CGContextSetFillColorWithColor(context, [UIColor blackColor].CGColor);"""
+          if old not in s:
+              raise SystemExit("graphics context patch point not found")
+          s = s.replace(old, new, 1)
+
+          old = """    CGRect frame = CGRectMake(1, 1, self.frame.size.width - shift, self.frame.size.height - shift);
+              CALayer *maskLayer = [CALayer layer];
+              maskLayer.frame = frame;
+              maskLayer.contents = (id)[roundedRectMask(frame.size) CGImage];"""
+          new = """    CGRect frame = CGRectMake(1, 1, self.frame.size.width - shift, self.frame.size.height - shift);
+              if (frame.size.width <= 0.0 || frame.size.height <= 0.0)
+                  return;
+              UIImage *maskImage = roundedRectMask(frame.size);
+              if (maskImage == nil)
+                  return;
+              CALayer *maskLayer = [CALayer layer];
+              maskLayer.frame = frame;
+              maskLayer.contents = (id)maskImage.CGImage;"""
+          if old not in s:
+              raise SystemExit("bbHook patch point not found")
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          # Keep the user's existing package ID so this upgrades 1.5.3 directly.
+          c = Path("control")
+          t = c.read_text()
+          t = re.sub(r"^Package:.*$", "Package: com.dao.blurrybadges", t, flags=re.M)
+          t = re.sub(r"^Architecture:.*$", "Architecture: iphoneos-arm64e", t, flags=re.M)
+          t = re.sub(r"^Name:.*$", "Name: BlurryBadges iOS17 Fix (RootHide)", t, flags=re.M)
+          t = re.sub(r"^Description:.*$", "Description: BlurryBadges iOS 17 RootHide crash fix.", t, flags=re.M)
+          c.write_text(t)
+
+          m = Path("Makefile")
+          x = m.read_text()
+          x = re.sub(r"^PACKAGE_VERSION\s*=.*$", "PACKAGE_VERSION = 1.5.3+ios17fix1", x, flags=re.M)
+          if not re.search(r"^ARCHS\s*=", x, flags=re.M):
+              x = "ARCHS = arm64 arm64e\n" + x
+          m.write_text(x)
+          PY
+
+      - name: Build RootHide package
+        working-directory: source
+        run: |
+          THEOS_PACKAGE_SCHEME=roothide make clean package FINALPACKAGE=1
+          ls -lah packages
+
+      - name: Upload DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: BlurryBadges-iOS17-RootHide-Fix
+          path: source/packages/*.deb
+          if-no-files-found: error
