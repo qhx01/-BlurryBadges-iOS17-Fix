@@ -1,0 +1,144 @@
+name: Build BlurryBadges iOS17 RootHide Fix
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup RootHide Theos
+        uses: waruhachi/theos-action@v2.4.6
+        with:
+          theos-src: roothide/theos
+          theos-branch: master
+          sdks-src: theos/sdks
+          sdks-branch: master
+          libgcuniversal: 'false'
+          altlist: 'false'
+
+      - name: Fetch upstream BlurryBadges
+        run: |
+          git clone https://github.com/PoomSmart/BlurryBadges.git source
+          cd source
+          git checkout 9256cd0fcba66d49db06f14b16242d536d68ce42
+
+      - name: Install and verify PSHeader
+        run: |
+          rm -rf "$THEOS/include/PSHeader"
+          git clone --depth 1 https://github.com/PoomSmart/PSHeader.git "$THEOS/include/PSHeader"
+          test -f "$THEOS/include/PSHeader/Misc.h"
+          test -f "$THEOS/include/PSHeader/PAC.h"
+          echo "PSHeader OK: $THEOS/include/PSHeader/Misc.h"
+
+      - name: Apply iOS 17 crash fix
+        working-directory: source
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          tweak = Path("Tweak.xm")
+          s = tweak.read_text()
+
+          old = """static UIImage *roundedRectMask(CGSize size) {
+              CGFloat realCornerRadius = size.height / 2;"""
+          new = """static UIImage *roundedRectMask(CGSize size) {
+              // iOS 17: never create a bitmap context with zero/negative dimensions.
+              if (size.width <= 0.0 || size.height <= 0.0)
+                  return nil;
+              CGFloat realCornerRadius = size.height / 2;"""
+          if old not in s:
+              raise SystemExit("roundedRectMask patch point not found")
+          s = s.replace(old, new, 1)
+
+          old = """    CGContextRef context = UIGraphicsGetCurrentContext();
+              CGContextSetFillColorWithColor(context, [UIColor blackColor].CGColor);"""
+          new = """    CGContextRef context = UIGraphicsGetCurrentContext();
+              if (context == NULL) {
+                  UIGraphicsEndImageContext();
+                  return nil;
+              }
+              CGContextSetFillColorWithColor(context, [UIColor blackColor].CGColor);"""
+          if old not in s:
+              raise SystemExit("graphics context patch point not found")
+          s = s.replace(old, new, 1)
+
+          old = """    CGRect frame = CGRectMake(1, 1, self.frame.size.width - shift, self.frame.size.height - shift);
+              CALayer *maskLayer = [CALayer layer];
+              maskLayer.frame = frame;
+              maskLayer.contents = (id)[roundedRectMask(frame.size) CGImage];"""
+          new = """    CGRect frame = CGRectMake(1, 1, self.frame.size.width - shift, self.frame.size.height - shift);
+              if (frame.size.width <= 0.0 || frame.size.height <= 0.0)
+                  return;
+              UIImage *maskImage = roundedRectMask(frame.size);
+              if (maskImage == nil)
+                  return;
+              CALayer *maskLayer = [CALayer layer];
+              maskLayer.frame = frame;
+              maskLayer.contents = (id)maskImage.CGImage;"""
+          if old not in s:
+              raise SystemExit("badge mask patch point not found")
+          s = s.replace(old, new, 1)
+          tweak.write_text(s)
+
+          control = Path("control")
+          c = control.read_text()
+          c = re.sub(r"^Package:.*$", "Package: com.dao.blurrybadges", c, flags=re.M)
+          c = re.sub(r"^Name:.*$", "Name: BlurryBadges iOS17 Fix (RootHide)", c, flags=re.M)
+          c = re.sub(r"^Description:.*$", "Description: BlurryBadges iOS 17 RootHide crash fix.", c, flags=re.M)
+          control.write_text(c)
+
+          makefile = Path("Makefile")
+          m = makefile.read_text()
+          m = re.sub(r"^PACKAGE_VERSION\s*=.*$", "PACKAGE_VERSION = 1.5.3+ios17fix1", m, flags=re.M)
+          if not re.search(r"^ARCHS\s*=", m, flags=re.M):
+              m = "ARCHS = arm64 arm64e\n" + m
+
+          pref_flags = "$(BUNDLE_NAME)_CFLAGS = -fobjc-arc"
+          if pref_flags in m:
+              m = m.replace(
+                  pref_flags,
+                  "$(BUNDLE_NAME)_CFLAGS = -fobjc-arc -I$(THEOS)/include",
+                  1
+              )
+          elif "-I$(THEOS)/include" not in m:
+              raise SystemExit("Preference bundle CFLAGS patch point not found")
+
+          makefile.write_text(m)
+
+          # Fail early if any expected modification did not land.
+          out = tweak.read_text()
+          if "if (size.width <= 0.0 || size.height <= 0.0)" not in out:
+              raise SystemExit("size guard verification failed")
+          if "UIImage *maskImage = roundedRectMask(frame.size);" not in out:
+              raise SystemExit("mask image verification failed")
+          if "Package: com.dao.blurrybadges" not in control.read_text():
+              raise SystemExit("package id verification failed")
+          if "-I$(THEOS)/include" not in makefile.read_text():
+              raise SystemExit("PSHeader include path verification failed")
+
+          print("Patch verification OK")
+          PY
+
+      - name: Build RootHide package
+        working-directory: source
+        run: |
+          test -f "$THEOS/include/PSHeader/Misc.h"
+          THEOS_PACKAGE_SCHEME=roothide make clean package FINALPACKAGE=1
+          echo "Built packages:"
+          ls -lah packages
+          test -n "$(find packages -maxdepth 1 -name '*.deb' -print -quit)"
+
+      - name: Upload DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: BlurryBadges-iOS17-RootHide-Fix
+          path: source/packages/*.deb
+          if-no-files-found: error
